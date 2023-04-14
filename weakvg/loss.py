@@ -34,10 +34,10 @@ class Loss(nn.Module):
         pos = self.select_pos(x)  # [b, b]
         neg = self.select_neg(x, pos)  # [b, b]
 
-        scores_p = (scores * pos).sum(-1) / pos.sum(-1)  # [b]
-        scores_n = (scores * neg).sum(-1) / neg.sum(-1)  # [b]
+        scores_p = (scores * pos).sum() / pos.sum()  # [1]
+        scores_n = (scores * neg).sum() / neg.sum()  # [1]
 
-        return -scores_p.mean() + scores_n.mean()
+        return -scores_p + scores_n
 
     def select_pos(self, x):
         scores = x["scores"]  # [b, q, b, p]
