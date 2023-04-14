@@ -30,11 +30,11 @@ class WeakvgModel(pl.LightningModule):
         self.use_relations = use_relations
         self.lr = lr
         # TODO: temporarily freezed, revert back to False
-        we = WordEmbedding(wordvec, freeze=True)
+        # we = WordEmbedding(wordvec, freeze=True)
         we_freezed = WordEmbedding(wordvec, freeze=True)
         self.concept_branch = ConceptBranch(word_embedding=we_freezed)
-        self.visual_branch = VisualBranch(word_embedding=we)
-        self.textual_branch = TextualBranch(word_embedding=we)
+        self.visual_branch = VisualBranch(word_embedding=we_freezed)
+        self.textual_branch = TextualBranch(word_embedding=we_freezed)
         self.prediction_module = SimilarityPredictionModule(omega=omega)
         self.loss = Loss(word_embedding=we_freezed, neg_selection=neg_selection)
 
