@@ -3,29 +3,48 @@ from typing import List
 
 import torch
 import torch.nn as nn
+import torchtext
+
+WV_GLOVE = "glove"
+WV_BERT = "bert"
+WV_TYPES = [WV_GLOVE, WV_BERT]
 
 
 def get_wordvec(
-    name="6B",
-    dim=300,
+    wv_type=WV_GLOVE,
+    config={},
     *,
-    cache="data/glove",
     custom_labels: List[str] = [],
     custom_tokens: List[str] = [],
     return_vocab=True,
 ):
-    builder = (
-        WordvecBuilder()
-        .with_glove(name, dim, cache=cache)
-        .with_vocab()
-        .with_custom_labels(custom_labels)
-        .with_custom_tokens(custom_tokens)
-    )
+    if wv_type not in WV_TYPES:
+        raise ValueError(f"Wordvec type '{wv_type}' not supported, allowed types are {WV_TYPES}")
 
-    wordvec = builder.get_wordvec()
-    vocab = builder.get_vocab()
+    if wv_type == WV_BERT:
+        model = "bert-base-uncased"
 
-    logging.info(f"Added {builder.n_added_tokens} custom tokens")
+        builder = (
+            BertBuilder(model)
+            .with_vocab()
+            .with_bert()
+        )
+
+    if wv_type == WV_GLOVE:
+        model = "6B"
+        dim = config.get("dim", 300)
+
+        builder = (
+            WordvecBuilder()
+            .with_glove(model, dim, cache="data/glove")
+            .with_vocab()
+            .with_custom_labels(custom_labels)
+            .with_custom_tokens(custom_tokens)
+        )
+
+        logging.info(f"Added {builder.n_added_tokens} custom tokens")
+
+    wordvec, vocab = builder.build()
 
     if return_vocab:
         return wordvec, vocab
@@ -47,10 +66,42 @@ def get_nlp():
     return nlp
 
 
-def get_tokenizer():
-    from torchtext.data.utils import get_tokenizer as get_t
+def get_tokenizer(wv_type=WV_GLOVE):
+    if wv_type not in WV_TYPES:
+        raise ValueError(f"Wordvec type '{wv_type}' not supported, allowed types are {WV_TYPES}")
 
-    return get_t("basic_english")
+    if wv_type == WV_BERT:
+        from transformers import BertTokenizer
+
+        bert_model = "bert-base-uncased"
+
+        tokenizer = BertTokenizer.from_pretrained(bert_model)
+
+        # We delegate to the tokenizer the padding and truncation logic
+        # to make the collate_fn simpler and agnostic to the wordvec type.
+        # To make this happen, we need to specify in the dataset class the
+        # sentence and queries lengths.
+
+        def wrapper(text, **kwargs):
+            kwargs_default = {
+                "padding": "max_length",
+                "max_length": 12,
+                "truncation": True,
+            }
+
+            input_ids = tokenizer(text, **(kwargs_default | kwargs))["input_ids"]
+
+            tokens = tokenizer.convert_ids_to_tokens(input_ids)
+            
+            return tokens
+
+    if wv_type == WV_GLOVE:
+        tokenizer = torchtext.data.utils.get_tokenizer("basic_english")
+
+        def wrapper(text, **kwargs):
+            return tokenizer(text)
+    
+    return wrapper
 
 
 class WordvecBuilder:
@@ -63,11 +114,8 @@ class WordvecBuilder:
 
     spell = SpellChecker()
 
-    def get_wordvec(self):
-        return self.wordvec
-
-    def get_vocab(self):
-        return self.vocab
+    def build(self):
+        return self.wordvec, self.vocab
 
     def with_glove(self, name="840B", dim=300, **kwargs):
         from torchtext.vocab import GloVe
@@ -187,3 +235,32 @@ class WordvecBuilder:
         self.wordvec.stoi[token] = len(self.wordvec.itos) - 1
 
         self.n_added_tokens += 1
+
+
+class BertBuilder:
+    vocab = None
+    wordvec = None
+
+    def __init__(self, model="bert-base-uncased"):
+        self.model = model
+
+    def build(self):
+        return self.wordvec, self.vocab
+
+    def with_vocab(self, *init_inputs, **kwargs):
+        from torchtext.vocab import vocab as make_vocab
+        from transformers import BertTokenizer
+
+        tokenizer = BertTokenizer.from_pretrained(self.model, *init_inputs, **kwargs)
+
+        self.vocab = make_vocab(tokenizer.vocab, min_freq=0)
+        self.vocab.set_default_index(self.vocab["[UNK]"])
+
+        return self
+
+    def with_bert(self):
+        from transformers import BertModel
+
+        self.wordvec = BertModel.from_pretrained(self.model)
+
+        return self

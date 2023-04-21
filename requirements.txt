@@ -11,3 +11,4 @@ pytorch-lightning
 pytest
 spacy
 tensorboard
+transformers

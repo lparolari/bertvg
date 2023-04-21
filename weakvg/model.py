@@ -29,11 +29,12 @@ class WeakvgModel(pl.LightningModule):
         super().__init__()
         self.use_relations = use_relations
         self.lr = lr
-        we = WordEmbedding(wordvec, vocab, freeze=False)
-        we_freezed = WordEmbedding(wordvec, vocab, freeze=True)
+        # TODO: temporarily freezed, revert back to False
+        # we = WordEmbedding(wordvec, freeze=True)
+        we_freezed = WordEmbedding(wordvec, freeze=True)
         self.concept_branch = ConceptBranch(word_embedding=we_freezed)
-        self.visual_branch = VisualBranch(word_embedding=we)
-        self.textual_branch = TextualBranch(word_embedding=we)
+        self.visual_branch = VisualBranch(word_embedding=we_freezed)
+        self.textual_branch = TextualBranch(word_embedding=we_freezed)
         self.prediction_module = SimilarityPredictionModule(omega=omega)
         self.loss = Loss(word_embedding=we_freezed, neg_selection=neg_selection)
 
@@ -280,15 +281,58 @@ class SimilarityPredictionModule(nn.Module):
 
 
 class WordEmbedding(nn.Module):
-    def __init__(self, wordvec, vocab, *, freeze=True):
+    def __init__(self, wordvec, *, freeze=True):
         super().__init__()
 
-        self.embedding = nn.Embedding.from_pretrained(
-            wordvec.vectors, freeze=freeze, padding_idx=vocab.get_default_index()
+        from torchtext.vocab import Vectors
+        from transformers import BertModel
+
+        if issubclass(type(wordvec), Vectors):
+            self.factory = "vectors"
+            self.emb = nn.Embedding.from_pretrained(
+                wordvec.vectors, freeze=freeze, padding_idx=0
+            )
+
+        if issubclass(type(wordvec), BertModel):
+            self.factory = "bert"
+            self.bert = wordvec
+            self.lin = nn.Linear(768, 300)
+
+            for param in self.bert.parameters():
+                param.requires_grad = not freeze
+
+            nn.init.xavier_uniform_(self.lin.weight)
+            nn.init.zeros_(self.lin.bias)
+
+    def forward(self, x, *args, **kwargs):
+        if self.factory == "bert":
+            mask = args[0]
+            return self.forward_bert(x, mask, **kwargs)
+
+        if self.factory == "vectors":
+            return self.emb(x)
+
+        raise NotImplementedError(
+            f"WordEmbedding does not implement '{self.factory}' factory"
         )
 
-    def forward(self, x):
-        return self.embedding(x)
+    def forward_bert(self, x, mask, **kwargs):
+        kwargs = {"return_dict": False} | kwargs
+
+        sh = x.shape
+
+        input_ids = x.reshape(-1, sh[-1])
+        attention_mask = mask.reshape(-1, sh[-1]).long()
+
+        out, _ = self.bert(input_ids, attention_mask, **kwargs)
+
+        out = out.reshape(*sh, -1)
+
+        out = out.masked_fill(~mask.unsqueeze(-1), 0)
+        out = self.lin(out)
+        out = out.masked_fill(~mask.unsqueeze(-1), 0)
+
+        return out
 
 
 class ConceptBranch(nn.Module):
@@ -301,16 +345,22 @@ class ConceptBranch(nn.Module):
         heads = x["heads"]  # [b, q, h]
         labels = x["labels"]  # [b, p]
 
-        n_heads = (heads != 0).sum(-1).unsqueeze(-1)  # [b, q, 1]
+        heads_mask = heads != 0  # [b, q, h]
+        n_heads = heads_mask.sum(-1).unsqueeze(-1)  # [b, q, 1]
 
-        heads_e = self.we(heads)  # [b, q, h, d]
-        heads_e = heads_e.sum(-2) / n_heads  # [b, q, d]
+        label_mask = labels != 0
+
+        heads_e = self.we(heads, heads_mask)  # [b, q, h, d]
+        heads_e = heads_e.masked_fill(~heads_mask.unsqueeze(-1), 0.)
+        heads_e = heads_e.sum(-2) / n_heads.clamp(1)  # [b, q, d]  - clamp is required to avoid div by 0
         heads_e = heads_e.unsqueeze(-2).unsqueeze(-2)  # [b, q, 1, 1, d]
 
-        labels_e = self.we(labels)  # [b, p, d]
+        labels_e = self.we(labels, label_mask)  # [b, p, d]
         labels_e = labels_e.unsqueeze(0).unsqueeze(0)  # [1, 1, b, p, d]
 
         scores = self.sim_fn(heads_e, labels_e)  # [b, q, b, p]
+
+        scores = scores.masked_fill(~get_concepts_mask_(x), 0)
 
         return scores
 
@@ -331,15 +381,15 @@ class VisualBranch(nn.Module):
         proposals_feat = x["proposals_feat"]  # [b, p, v]
         labels = x["labels"]  # [b, p]
 
-        mask = get_proposals_mask(proposals).unsqueeze(-1)  # [b, p, 1]
+        mask = get_proposals_mask(proposals)  # [b, p]
 
-        labels_e = self.we(labels)  # [b, p, d]
+        labels_e = self.we(labels, mask)  # [b, p, d]
         spat = self.spatial(x)  # [b, p, 5]
 
         proj = self.project(proposals_feat, spat)  # [b, p, d]
         fusion = proj + labels_e  # [b, p, d]
 
-        fusion = fusion.masked_fill(~mask, 0)
+        fusion = fusion.masked_fill(~mask.unsqueeze(-1), 0)
 
         return fusion
 
@@ -386,10 +436,10 @@ class TextualBranch(nn.Module):
         q = queries.shape[1]
         w = queries.shape[2]
 
-        _, is_query = get_queries_mask(queries)
+        is_word, is_query = get_queries_mask(queries)
         n_words, _ = get_queries_count(queries)
 
-        queries_e = self.we(queries)  # [b, q, w, d]
+        queries_e = self.we(queries, is_word)  # [b, q, w, d]
 
         d = queries_e.shape[-1]
 

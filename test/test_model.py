@@ -8,9 +8,15 @@ from weakvg.wordvec import get_wordvec
 
 
 class TestWordEmbedding(unittest.TestCase):
+    def setUp(self):
+        import pytorch_lightning as pl
+
+        # seeding is required for reproducibility with BERT
+        pl.seed_everything(42)
+
     def test_word_embedding_similarity(self):
         wordvec, vocab = get_wordvec()
-        we = WordEmbedding(wordvec, vocab)
+        we = WordEmbedding(wordvec)
 
         index = torch.tensor([vocab["man"], vocab["woman"], vocab["person"]])
 
@@ -20,15 +26,58 @@ class TestWordEmbedding(unittest.TestCase):
         woman = emb[1]
         person = emb[2]
 
-        self.assertAlmostEqual(
-            cosine_similarity(man, person, dim=0).item(), 0.6443, places=4
-        )
-        self.assertAlmostEqual(
-            cosine_similarity(woman, person, dim=0).item(), 0.6171, places=4
-        )
-        self.assertAlmostEqual(
-            cosine_similarity(man, woman, dim=0).item(), 0.6999, places=4
-        )
+        self.assertTensorAlmostEqual(cosine_similarity(man, person, dim=0), 0.6443)
+        self.assertTensorAlmostEqual(cosine_similarity(woman, person, dim=0), 0.6171)
+        self.assertTensorAlmostEqual(cosine_similarity(man, woman, dim=0), 0.6999)
+
+    def test_word_embedding_similarity_bert(self):
+        wordvec, vocab = get_wordvec("bert")
+        we = WordEmbedding(wordvec)
+
+        index = torch.tensor([vocab["man"], vocab["woman"], vocab["person"]])
+        attn = torch.tensor([1, 1, 1]).bool()
+
+        emb = we(index, attn)
+
+        man = emb[0]
+        woman = emb[1]
+        person = emb[2]
+
+        self.assertTensorAlmostEqual(cosine_similarity(man, person, dim=0), 0.9381)
+        self.assertTensorAlmostEqual(cosine_similarity(woman, person, dim=0), 0.9927)
+        self.assertTensorAlmostEqual(cosine_similarity(man, woman, dim=0), 0.9454)
+
+    def test_word_embedding_similarity_bert_on_single_words(self):
+        wordvec, vocab = get_wordvec("bert")
+        we = WordEmbedding(wordvec)
+        sim = cosine_similarity
+
+        index = torch.tensor([vocab["man"], vocab["woman"], vocab["person"]])
+        attn = torch.tensor([1, 1, 1]).bool()
+
+        emb = we(index, attn)
+        emb_man = we(index[0:1], attn[0:1])
+        emb_woman = we(index[1:2], attn[1:2])
+        emb_person = we(index[2:3], attn[2:3])
+
+        man = emb[0]
+        woman = emb[1]
+        person = emb[2]
+
+        man_nodep = emb_man[0]
+        woman_nodep = emb_woman[0]
+        person_nodep = emb_person[0]
+
+        self.assertTensorAlmostEqual(sim(man_nodep, person_nodep, dim=0), 0.4169)
+        self.assertTensorAlmostEqual(sim(woman_nodep, person_nodep, dim=0), 0.4421)
+        self.assertTensorAlmostEqual(sim(man_nodep, woman_nodep, dim=0), 0.4858)
+
+        self.assertTensorAlmostEqual(sim(man, man_nodep, dim=0), 0.5119)
+        self.assertTensorAlmostEqual(sim(woman, woman_nodep, dim=0), 0.3374)
+        self.assertTensorAlmostEqual(sim(person, person_nodep, dim=0), 0.3712)
+
+    def assertTensorAlmostEqual(self, t, x, places=3):
+        self.assertAlmostEqual(t.item(), x, places=places)
 
 
 class TestTextualBranch(unittest.TestCase):
@@ -36,7 +85,7 @@ class TestTextualBranch(unittest.TestCase):
         super().setUp()
 
         self.wordvec, self.vocab = get_wordvec()
-        self.we = WordEmbedding(self.wordvec, self.vocab)
+        self.we = WordEmbedding(self.wordvec)
 
     def test_lstm(self):
         queries_idx = [
@@ -57,7 +106,7 @@ class TestVisualBranch(unittest.TestCase):
         super().setUp()
 
         self.wordvec, self.vocab = get_wordvec()
-        self.we = WordEmbedding(self.wordvec, self.vocab)
+        self.we = WordEmbedding(self.wordvec)
 
     def test_spatial(self):
         proposals = torch.tensor([[[20, 20, 80, 100]]])  # [b, p, 4]
@@ -94,7 +143,7 @@ class TestConceptBranch(unittest.TestCase):
         super().setUp()
 
         self.wordvec, self.vocab = get_wordvec()
-        self.we = WordEmbedding(self.wordvec, self.vocab)
+        self.we = WordEmbedding(self.wordvec)
 
     def test_forward(self):
         heads = torch.tensor(

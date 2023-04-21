@@ -17,8 +17,9 @@ def main():
 
     pl.seed_everything(42, workers=True)
 
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer(args.wv_type)
     wordvec, vocab = get_wordvec(
+        args.wv_type,
         custom_labels=[] if args.dev else get_objects_vocab(),
         custom_tokens=[], # TODO: get_objects_vocab("data/objects_vocab_merged.txt"),
     )

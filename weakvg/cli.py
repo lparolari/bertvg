@@ -126,6 +126,12 @@ def get_args():
         action="store_true",
         help="Enable the attention mask based on relations. Default: false",
     )
+    model_group.add_argument(
+        "--wv_type",
+        default="glove",
+        choices=["glove", "bert"],
+        help="Word vector type. Default: glove",
+    )
 
     args = parser.parse_args()
 

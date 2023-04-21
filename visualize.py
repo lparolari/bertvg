@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None, required=True)
     parser.add_argument("--dataset", type=str, required=True, choices=["flickr30k", "referit"])
     parser.add_argument("--split", type=str, default="val")
+    parser.add_argument("--wv_type", type=str, default="glove")
     parser.add_argument("--search", type=str, default=None)
     parser.add_argument("--show_proposals", action="store_true", default=False)
 
@@ -40,12 +41,13 @@ def main():
     checkpoint = args.checkpoint
     search = args.search
     split = args.split
+    wv_type = args.wv_type
     show_proposals = args.show_proposals
 
     pl.seed_everything(42, workers=True)
 
     tokenizer = get_tokenizer()
-    wordvec, vocab = get_wordvec(custom_labels=get_objects_vocab())
+    wordvec, vocab = get_wordvec(wv_type, custom_labels=get_objects_vocab())
     nlp = get_nlp()
 
     dataset_cls = WeakvgDataModule.get_dataset_cls(dataset_name)

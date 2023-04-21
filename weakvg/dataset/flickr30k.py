@@ -333,7 +333,7 @@ class Flickr30kDataset(Dataset, UpperboundAccuracyMixin, QueryNumberMixin):
         meta = [idx, sample["identifier"]]
         sentence = self._prepare_sentence(sample["sentence"])
         queries = self._prepare_queries(sample["queries"])
-        heads = self._prepare_queries(sample["heads"])
+        heads = self._prepare_heads(sample["heads"])
         image_w = sample["image_w"]
         image_h = sample["image_h"]
         proposals = sample["proposals"]
@@ -443,14 +443,21 @@ class Flickr30kDataset(Dataset, UpperboundAccuracyMixin, QueryNumberMixin):
         return f"{self.data_dir}/flickr30k_images/{image_id}.jpg"
 
     def _prepare_sentence(self, sentence: str) -> List[int]:
-        sentence = self.tokenizer(sentence)
+        sentence = self.tokenizer(sentence, max_length=32)
         sentence = self.vocab(sentence)
         return sentence
 
     def _prepare_queries(self, queries: List[str]) -> List[List[int]]:
-        queries = [self.tokenizer(query) for query in queries]
+        queries = [self.tokenizer(query, max_length=12) for query in queries]
         queries = [self.vocab(query) for query in queries]
         return queries
+
+    def _prepare_heads(self, heads: List[str]) -> List[List[int]]:
+        # we use a custom tokenizer for heads that splits on spaces ignoring
+        # rules on sub-words (like in BERT)
+        heads = [head.split() for head in heads]
+        heads = [self.vocab(head) for head in heads]
+        return heads
 
     def _prepare_labels(self, labels: List[str]) -> List[int]:
         return self.vocab(labels)
