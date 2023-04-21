@@ -21,39 +21,54 @@ class WeakvgModel(pl.LightningModule):
         self,
         wordvec,
         vocab,
-        omega=0.5,
         lr=1e-5,
+        omega=0.5,
+        hidden_size=300,
         neg_selection="random",
         use_relations=False,
     ) -> None:
         super().__init__()
+        self.vocab = vocab  # for debugging purposes - decode queries indexes
+
+        # hyper parameters
         self.use_relations = use_relations
         self.lr = lr
-        # TODO: temporarily freezed, revert back to False
-        # we = WordEmbedding(wordvec, freeze=True)
-        we_freezed = WordEmbedding(wordvec, freeze=True)
-        self.concept_branch = ConceptBranch(word_embedding=we_freezed)
-        self.visual_branch = VisualBranch(word_embedding=we_freezed)
-        self.textual_branch = TextualBranch(word_embedding=we_freezed)
+        self.hidden_size = hidden_size
+
+        # modules
+        self.we = WordEmbedding(wordvec, hid_size=hidden_size, freeze=True)
+        self.concept_branch = ConceptBranch()
+        self.visual_branch = VisualBranch(hid_size=hidden_size)
+        self.textual_branch = TextualBranch(hid_size=hidden_size)
         self.prediction_module = SimilarityPredictionModule(omega=omega)
-        self.loss = Loss(word_embedding=we_freezed, neg_selection=neg_selection)
+        self.loss = Loss(neg_selection=neg_selection)
 
         self.save_hyperparameters(ignore=["wordvec", "vocab"])
 
     def forward(self, x):
-        concepts_pred = self.concept_branch(x)  # [b, q, b, p]
+        queries = x["queries"]
+        queries_mask = get_queries_mask(x)[1]
 
-        visual_feat = self.visual_branch(x)  # [b, p, d], [b, p, 1]
+        queries_e, queries_pooler = self.we(
+            queries, queries_mask, return_pooler=True
+        )  # [b, q, w, d], [b, q, d]
+        heads_e = None  # TODO: get the heads embedding from queries_e through index
+        labels_e = None  # TODO: follow the paper
 
-        textual_feat = self.textual_branch(x)  # [b, q, d], [b, q, 1]
+        x |= {"queries_e": queries_e, "heads_e": heads_e, "labels_e": labels_e}
+
+        # TODO: concepts branch temporarily disabled
+        # concepts_pred = self.concept_branch(x)  # [b, q, b, p]
+        visual_feat = self.visual_branch(x)  # [b, p, d]
+        textual_feat = queries_pooler
 
         visual_mask = get_proposals_mask_(x)  # [b, p]
         textual_mask = get_queries_mask_(x)[1]  # [b, q]
-        concepts_mask = get_concepts_mask_(x)  # [b, q, b, p]
+        # concepts_mask = get_concepts_mask_(x)  # [b, q, b, p]
 
-        if self.use_relations:
-            relations_mask = get_relations_mask_(x)  # [b, q, b, p]
-            concepts_mask = concepts_mask.logical_and(relations_mask)  # [b, q, b, p]
+        # if self.use_relations:
+        #     relations_mask = get_relations_mask_(x)  # [b, q, b, p]
+        #     concepts_mask = concepts_mask.logical_and(relations_mask)  # [b, q, b, p]
 
         scores, (multimodal_scores, concepts_scores) = self.prediction_module(
             (visual_feat, visual_mask),
@@ -281,58 +296,63 @@ class SimilarityPredictionModule(nn.Module):
 
 
 class WordEmbedding(nn.Module):
-    def __init__(self, wordvec, *, freeze=True):
+    def __init__(self, wordvec, hid_size=768, *, freeze=True):
         super().__init__()
+        self.bert = wordvec
 
-        from torchtext.vocab import Vectors
-        from transformers import BertModel
+        for param in self.bert.parameters():
+            param.requires_grad = not freeze
 
-        if issubclass(type(wordvec), Vectors):
-            self.factory = "vectors"
-            self.emb = nn.Embedding.from_pretrained(
-                wordvec.vectors, freeze=freeze, padding_idx=0
-            )
+        self.hid_size = hid_size
+        self.wordemb_size = self.bert.config.hidden_size
 
-        if issubclass(type(wordvec), BertModel):
-            self.factory = "bert"
-            self.bert = wordvec
-            self.lin = nn.Linear(768, 300)
-
-            for param in self.bert.parameters():
-                param.requires_grad = not freeze
+        if self.wordemb_size != self.hid_size:
+            self.lin = nn.Linear(self.wordemb_size, self.hid_size)
 
             nn.init.xavier_uniform_(self.lin.weight)
             nn.init.zeros_(self.lin.bias)
 
-    def forward(self, x, *args, **kwargs):
-        if self.factory == "bert":
-            mask = args[0]
-            return self.forward_bert(x, mask, **kwargs)
-
-        if self.factory == "vectors":
-            return self.emb(x)
-
-        raise NotImplementedError(
-            f"WordEmbedding does not implement '{self.factory}' factory"
-        )
-
-    def forward_bert(self, x, mask, **kwargs):
+    def forward(self, x, mask, **kwargs):
+        """
+        :param x: A tensor of shape `[*, w]` with the input ids
+        :param mask: A tensor of shape `[*, w]` with the attention mask
+        :return: A tensor of shape `[*, w, d]` with the word embeddings
+            (d = hid_size) and a tensor of shape `[*, d]` with the pooler
+            output if `return_pooler=True`
+        """
+        return_pooler = kwargs.pop("return_pooler", False)
+        return_dict = kwargs.pop("return_dict", False)
         kwargs = {"return_dict": False} | kwargs
 
-        sh = x.shape
+        shape = x.shape
 
-        input_ids = x.reshape(-1, sh[-1])
-        attention_mask = mask.reshape(-1, sh[-1]).long()
+        input_ids = x.reshape(
+            -1, shape[-1]
+        )  # [s, w], s = x1 * ... * xn-1 given * = [x1, ..., xn]
+        attention_mask = mask.reshape(-1, shape[-1]).long()
 
-        out, _ = self.bert(input_ids, attention_mask, **kwargs)
+        out, pooler = self.bert(
+            input_ids, attention_mask, **kwargs
+        )  # [s, w, d], [s, d]
 
-        out = out.reshape(*sh, -1)
-
+        out = out.reshape(*shape, -1)  # [*, w, d]
         out = out.masked_fill(~mask.unsqueeze(-1), 0)
-        out = self.lin(out)
-        out = out.masked_fill(~mask.unsqueeze(-1), 0)
+
+        pooler = pooler.reshape(*shape[:-1], -1)  # [*, d]
+
+        if self.wordemb_size != self.hid_size:
+            out = self.lin(out)  # [*, w, d']
+            out = out.masked_fill(~mask.unsqueeze(-1), 0)
+
+            pooler = self.lin(pooler)  # [*, d']
+
+        if return_pooler:
+            return out, pooler
 
         return out
+
+    def forward_queries(self):
+        pass
 
 
 class ConceptBranch(nn.Module):
@@ -351,8 +371,10 @@ class ConceptBranch(nn.Module):
         label_mask = labels != 0
 
         heads_e = self.we(heads, heads_mask)  # [b, q, h, d]
-        heads_e = heads_e.masked_fill(~heads_mask.unsqueeze(-1), 0.)
-        heads_e = heads_e.sum(-2) / n_heads.clamp(1)  # [b, q, d]  - clamp is required to avoid div by 0
+        heads_e = heads_e.masked_fill(~heads_mask.unsqueeze(-1), 0.0)
+        heads_e = heads_e.sum(-2) / n_heads.clamp(
+            1
+        )  # [b, q, d]  - clamp is required to avoid div by 0
         heads_e = heads_e.unsqueeze(-2).unsqueeze(-2)  # [b, q, 1, 1, d]
 
         labels_e = self.we(labels, label_mask)  # [b, p, d]
@@ -366,12 +388,10 @@ class ConceptBranch(nn.Module):
 
 
 class VisualBranch(nn.Module):
-    def __init__(self, word_embedding):
+    def __init__(self, hid_size):
         super().__init__()
 
-        self.we = word_embedding
-
-        self.fc = nn.Linear(2048 + 5, 300)
+        self.fc = nn.Linear(2048 + 5, hid_size)
         self.act = nn.LeakyReLU()
 
         self._init_weights()
@@ -379,11 +399,12 @@ class VisualBranch(nn.Module):
     def forward(self, x):
         proposals = x["proposals"]  # [b, p, 4]
         proposals_feat = x["proposals_feat"]  # [b, p, v]
-        labels = x["labels"]  # [b, p]
+        labels_e = x["labels_e"]  # [b, p, q, d]
+
+        # TODO: update the following code because labels_e are now query dependent
 
         mask = get_proposals_mask(proposals)  # [b, p]
 
-        labels_e = self.we(labels, mask)  # [b, p, d]
         spat = self.spatial(x)  # [b, p, 5]
 
         proj = self.project(proposals_feat, spat)  # [b, p, d]
@@ -422,10 +443,9 @@ class VisualBranch(nn.Module):
 
 
 class TextualBranch(nn.Module):
-    def __init__(self, word_embedding):
+    def __init__(self, hid_size):
         super().__init__()
-        self.we = word_embedding
-        self.lstm = nn.LSTM(300, 300)
+        self.lstm = nn.LSTM(hid_size, hid_size)
 
     def forward(self, x):
         from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence

@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 from weakvg.cli import get_args, get_callbacks, get_logger
 from weakvg.datamodule import WeakvgDataModule
 from weakvg.model import WeakvgModel
-from weakvg.wordvec import get_nlp, get_objects_vocab, get_tokenizer, get_wordvec
+from weakvg.wordvec import get_nlp, get_tokenizer, get_wordvec
 
 
 def main():
@@ -17,12 +17,8 @@ def main():
 
     pl.seed_everything(42, workers=True)
 
-    tokenizer = get_tokenizer(args.wv_type)
-    wordvec, vocab = get_wordvec(
-        args.wv_type,
-        custom_labels=[] if args.dev else get_objects_vocab(),
-        custom_tokens=[], # TODO: get_objects_vocab("data/objects_vocab_merged.txt"),
-    )
+    tokenizer = get_tokenizer()
+    wordvec, vocab = get_wordvec()
     nlp = get_nlp()
 
     dm = WeakvgDataModule(

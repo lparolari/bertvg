@@ -127,10 +127,10 @@ def get_args():
         help="Enable the attention mask based on relations. Default: false",
     )
     model_group.add_argument(
-        "--wv_type",
-        default="glove",
-        choices=["glove", "bert"],
-        help="Word vector type. Default: glove",
+        "--hidden_size",
+        type=int,
+        default=300,
+        help="Size of the visual and textual representation embeddings. Default: 300",
     )
 
     args = parser.parse_args()

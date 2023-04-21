@@ -22,7 +22,6 @@
         "--max_epochs=1",
         "--train_fract=0.01",
         "--use_relations",
-        "--wv_type=bert",
         "--omega=0.4"
       ],
       "console": "integratedTerminal",
