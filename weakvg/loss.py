@@ -5,7 +5,7 @@ from weakvg.masking import get_queries_count, get_queries_mask
 
 
 class Loss(nn.Module):
-    def __init__(self, word_embedding, neg_selection="random"):
+    def __init__(self, neg_selection="random"):
         """
         :param neg_selection: Negative selection strategy. One of:
           * `random`, selects one random negative example
@@ -13,7 +13,6 @@ class Loss(nn.Module):
             to the averaged similarity of queries among examples.
         """
         super().__init__()
-        self.we = word_embedding
         self.neg_selection = neg_selection
 
     def forward(self, x):

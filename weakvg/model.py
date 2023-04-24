@@ -37,48 +37,99 @@ class WeakvgModel(pl.LightningModule):
 
         # modules
         self.we = WordEmbedding(wordvec, hid_size=hidden_size, freeze=True)
-        self.concept_branch = ConceptBranch()
+        # self.concept_branch = ConceptBranch()
         self.visual_branch = VisualBranch(hid_size=hidden_size)
-        self.textual_branch = TextualBranch(hid_size=hidden_size)
         self.prediction_module = SimilarityPredictionModule(omega=omega)
         self.loss = Loss(neg_selection=neg_selection)
+
+        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, 1)
 
         self.save_hyperparameters(ignore=["wordvec", "vocab"])
 
     def forward(self, x):
         queries = x["queries"]
-        queries_mask = get_queries_mask(x)[1]
+        is_word, is_query = get_queries_mask_(x)
 
         queries_e, queries_pooler = self.we(
-            queries, queries_mask, return_pooler=True
+            queries, is_word, return_pooler=True
         )  # [b, q, w, d], [b, q, d]
         heads_e = None  # TODO: get the heads embedding from queries_e through index
         labels_e = None  # TODO: follow the paper
+
+        # heads
+
+        heads = x["heads"]  # [b, q, h]
+        heads = heads[..., 0]  # [b, q] - select the first head
+        is_head = (queries == heads.unsqueeze(-1)) & is_query.unsqueeze(-1)  # [b, q, w]
+        queries_h = queries.masked_fill(~is_head, 0)  # [b, q, w]
+        index = queries_h.argmax(-1)  # [b, q]
+        index = index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 1, queries_e.size(-1))  # [b, q, 1, d]
+        heads_e = queries_e.gather(-2, index).squeeze(-2)  # [b, q, d]
+        heads_e.masked_fill(~is_query.unsqueeze(-1), 0)
+
+        # labels
+
+        queries = x["queries"]  # [b, q, w]
+        labels = x["labels"]  # [b, p]
+        q = queries.shape[1]
+        w = queries.shape[-1]
+        p = labels.shape[-1]
+        labels = labels.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, q, w)  # [b, p, q, w]
+        queries = queries.unsqueeze(1).repeat(1, p, 1, 1)  # [b, p, q, w]
+        # calcolo maschera head
+        heads = x["heads"]  # [b, q, h]
+        heads = heads[..., 0]  # [b, q] - select the first head
+        is_head = (x["queries"] == heads.unsqueeze(-1)) & is_query.unsqueeze(-1)  # [b, q, w]
+        is_head = is_head.unsqueeze(1).repeat(1, p, 1, 1)  # [b, p, q, w]
+
+        is_head = is_head.long()
+
+        # azzero gli indici dove c'è la head e sommo l'indice della label (0 + label)
+        new_q = queries * (1 - is_head) + labels * is_head
+
+        is_head = is_head.bool()
+    
+        queries_ext_e = self.we(new_q, is_head)  # [b, p, q, w, d]
+
+        # ottengo l'indice della head head per estrarre l'embedding della label
+        queries_h = queries.masked_fill(~is_head, 0)  # [b, p, q, w]
+        index = queries_h.argmax(-1)  # [b, p, q]
+        index = index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 1, 1, queries_e.size(-1))  # [b, p, q, 1, d]
+        labels_e = queries_ext_e.gather(-2, index).squeeze(-2)  # [b, p, q, d]
 
         x |= {"queries_e": queries_e, "heads_e": heads_e, "labels_e": labels_e}
 
         # TODO: concepts branch temporarily disabled
         # concepts_pred = self.concept_branch(x)  # [b, q, b, p]
-        visual_feat = self.visual_branch(x)  # [b, p, d]
-        textual_feat = queries_pooler
+        b = x["proposals"].shape[0]
+        visual_feat = self.visual_branch(x)
+        visual_feat = visual_feat.transpose(1, 2).unsqueeze(2).repeat(1, 1, b, 1, 1)  # [b, q, b, q, d]
+        textual_feat = queries_pooler  # [b, q, d]
+        textual_feat = textual_feat.unsqueeze(2).unsqueeze(3).repeat(1, 1, b, p, 1)  # [b, q, b, p, d]
 
-        visual_mask = get_proposals_mask_(x)  # [b, p]
-        textual_mask = get_queries_mask_(x)[1]  # [b, q]
-        # concepts_mask = get_concepts_mask_(x)  # [b, q, b, p]
+        visual_mask = get_proposals_mask_(x).unsqueeze(-2).unsqueeze(-2).repeat(1, q, b, 1)
+        textual_mask = get_queries_mask_(x)[1].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, b, p)
+        mask = visual_mask & textual_mask
+        mask = mask.unsqueeze(-1)
 
-        # if self.use_relations:
-        #     relations_mask = get_relations_mask_(x)  # [b, q, b, p]
-        #     concepts_mask = concepts_mask.logical_and(relations_mask)  # [b, q, b, p]
+        # scores, (multimodal_scores, concepts_scores) = self.prediction_module(
+        #     (visual_feat, visual_mask),
+        #     (textual_feat, textual_mask),
+        #     # (concepts_pred, concepts_mask),
+        # )  # [b, q, b, p], ([b, q, b, p], [b, q, b, p])
 
-        scores, (multimodal_scores, concepts_scores) = self.prediction_module(
-            (visual_feat, visual_mask),
-            (textual_feat, textual_mask),
-            (concepts_pred, concepts_mask),
-        )  # [b, q, b, p], ([b, q, b, p], [b, q, b, p])
+        inp = torch.cat([visual_feat, textual_feat], dim=-1)
+        inp = inp.masked_fill(~mask, 0)
 
-        scores = scores.masked_fill(~get_mask_(x), 0)
+        inp = self.fc1(inp)
+        inp = self.act(inp)
+        scores = self.fc2(inp)
 
-        return scores, (multimodal_scores, concepts_scores)
+        scores = scores.masked_fill(~mask, 0)
+
+        return scores.squeeze(-1), (None, None)
 
     def step(self, batch, batch_idx):
         """
@@ -248,17 +299,20 @@ class SimilarityPredictionModule(nn.Module):
         multimodal_pred, multimodal_mask = self.predict_multimodal(
             visual, textual
         )  # [b, q, b, p], [b, q, b, p]
-        concepts_pred, concepts_mask = self.predict_concepts(
-            concepts
-        )  # [b, q, b, p], [b, q, b, p]
+        # concepts_pred, concepts_mask = self.predict_concepts(
+        #     concepts
+        # )  # [b, q, b, p], [b, q, b, p]
 
-        scores = self.apply_prior(multimodal_pred, concepts_pred)  # [b, q, b, p]
+        # scores = self.apply_prior(multimodal_pred, concepts_pred)  # [b, q, b, p]
+        scores = multimodal_pred
 
-        mask = multimodal_mask & concepts_mask  # [b, q, b, p]
+        # mask = multimodal_mask & concepts_mask  # [b, q, b, p]
+        mask = multimodal_mask
 
         scores = scores.masked_fill(~mask, 0)  # [b, q, b, p]
 
-        return scores, (multimodal_pred, concepts_pred)
+        # return scores, (multimodal_pred, concepts_pred)
+        return scores, (multimodal_pred, torch.zeros_like(multimodal_pred))
 
     def predict_multimodal(self, visual, textual):
         visual_feat, visual_mask = visual  # [b, q, d], [b, q]
@@ -351,9 +405,6 @@ class WordEmbedding(nn.Module):
 
         return out
 
-    def forward_queries(self):
-        pass
-
 
 class ConceptBranch(nn.Module):
     def __init__(self, word_embedding):
@@ -401,6 +452,8 @@ class VisualBranch(nn.Module):
         proposals_feat = x["proposals_feat"]  # [b, p, v]
         labels_e = x["labels_e"]  # [b, p, q, d]
 
+        q = labels_e.shape[-2]
+
         # TODO: update the following code because labels_e are now query dependent
 
         mask = get_proposals_mask(proposals)  # [b, p]
@@ -408,8 +461,10 @@ class VisualBranch(nn.Module):
         spat = self.spatial(x)  # [b, p, 5]
 
         proj = self.project(proposals_feat, spat)  # [b, p, d]
+        proj = proj.unsqueeze(-2).expand(-1, -1, q, -1)  # [b, p, q, d]
         fusion = proj + labels_e  # [b, p, d]
 
+        mask = mask.unsqueeze(-1).expand(-1, -1, q)  # [b, p, q]
         fusion = fusion.masked_fill(~mask.unsqueeze(-1), 0)
 
         return fusion
@@ -440,63 +495,3 @@ class VisualBranch(nn.Module):
     def _init_weights(self):
         nn.init.xavier_normal_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
-
-
-class TextualBranch(nn.Module):
-    def __init__(self, hid_size):
-        super().__init__()
-        self.lstm = nn.LSTM(hid_size, hid_size)
-
-    def forward(self, x):
-        from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
-        queries = x["queries"]
-
-        b = queries.shape[0]
-        q = queries.shape[1]
-        w = queries.shape[2]
-
-        is_word, is_query = get_queries_mask(queries)
-        n_words, _ = get_queries_count(queries)
-
-        queries_e = self.we(queries, is_word)  # [b, q, w, d]
-
-        d = queries_e.shape[-1]
-
-        queries_e = queries_e.view(-1, w, d)
-        queries_e = queries_e.permute(1, 0, 2).contiguous()
-
-        # required on CPU by pytorch, see
-        # https://pytorch.org/docs/stable/generated/torch.nn.utils.rnn.pack_padded_sequence.html
-        lengths = n_words.view(-1).cpu()
-        lengths = lengths.clamp(min=1)  # elements with 0 are not accepted
-
-        queries_packed = pack_padded_sequence(queries_e, lengths, enforce_sorted=False)
-
-        output, hidden = self.lstm(queries_packed)
-
-        queries_x, lengths = pad_packed_sequence(output)
-        # queries_x is a tensor with shape [l, b * q, d], where l is the max length
-        # of the non-padded sequence
-
-        lengths = lengths.to(queries.device)  # back to original device
-
-        # we need to gather the representation of the last word, so we can build an
-        # index based on lengths. for example, if we have a query with length 4, its
-        # index will be 3
-
-        index = lengths - 1  # [b * q]
-        index = index.unsqueeze(0).unsqueeze(-1)  # [1, b * q, 1]
-        index = index.repeat(1, 1, d)  # [1, b * q, d]
-
-        queries_x = queries_x.gather(0, index)  # [1, b * q, d]
-
-        queries_x = queries_x.permute(1, 0, 2).contiguous()  # [b * q, 1, d]
-        queries_x = queries_x.squeeze(1)  # [b * q, d]
-        queries_x = queries_x.view(b, q, d)  # [b, q, d]
-
-        mask = is_query.unsqueeze(-1)
-
-        queries_x = queries_x.masked_fill(~mask, 0)
-
-        return queries_x

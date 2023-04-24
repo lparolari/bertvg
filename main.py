@@ -45,6 +45,7 @@ def main():
             lr=args.lr,
             neg_selection=args.neg_selection,
             use_relations=args.use_relations,
+            hidden_size=args.hidden_size,
         )
 
     logging.info(f"Model hparams: " + json.dumps(model.hparams_initial, indent=4))
