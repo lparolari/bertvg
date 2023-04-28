@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch.nn.functional import cosine_similarity
 
-from weakvg.model import TextualBranch, WordEmbedding, VisualBranch, ConceptBranch
+from weakvg.model import WordEmbedding, VisualBranch
 from weakvg.wordvec import get_wordvec, get_tokenizer
 
 
@@ -15,7 +15,7 @@ class TestWordEmbedding(unittest.TestCase):
         pl.seed_everything(42)
 
     def test_bert_word_similarity(self):
-        wordvec, vocab = get_wordvec("bert")
+        wordvec, vocab = get_wordvec()
         we = WordEmbedding(wordvec)
 
         index = torch.tensor([vocab["man"], vocab["woman"], vocab["person"]])
@@ -32,7 +32,7 @@ class TestWordEmbedding(unittest.TestCase):
         self.assertTensorAlmostEqual(cosine_similarity(man, woman, dim=0), 0.9454)
 
     def test_bert_word_similarity__single_words(self):
-        wordvec, vocab = get_wordvec("bert")
+        wordvec, vocab = get_wordvec()
         we = WordEmbedding(wordvec)
         sim = cosine_similarity
 
@@ -66,21 +66,24 @@ class TestWordEmbedding(unittest.TestCase):
         we = WordEmbedding(wordvec)
         sim = cosine_similarity
 
-        def get_emb(sent):
-            index = torch.tensor(vocab(tokenizer(sent)))
-            attn = index != 0
+        def get_word_emb(sent, word):
+            word_idx = torch.tensor(vocab[word])
+            sent_idx = torch.tensor(vocab(tokenizer(sent)))
 
-            return we(index, attn)
+            attn = sent_idx != 0
 
-        girl = get_emb("the girl wearing a jacket")[1]
-        person = get_emb("the person wearing a jacket")[1]
-        elephant = get_emb("the elephant wearing a jacket")[1]
+            emb = we(sent_idx, attn)
 
-        self.assertTensorAlmostEqual(sim(girl, person, dim=0), 0.7098)
-        self.assertTensorAlmostEqual(sim(girl, elephant, dim=0), 0.8010)
-        self.assertTensorAlmostEqual(sim(elephant, person, dim=0), 0.7535)
-        # As shown above, cosine similarity is not suited for measuring
-        # semantic similarity with contextual embeddings
+            return emb[sent_idx == word_idx]
+
+        girl = get_word_emb("a girl wearing a red jacket", "girl")
+        person = get_word_emb("a person wearing a red jacket", "person")
+        elephant = get_word_emb("an elephant wearing a red jacket", "elephant")
+
+        self.assertEqual(girl.shape, (1, 768))
+        self.assertTensorAlmostEqual(sim(girl, person, dim=-1), 0.6346)
+        self.assertTensorAlmostEqual(sim(girl, elephant, dim=-1), 0.4082)
+        self.assertTensorAlmostEqual(sim(elephant, person, dim=-1), 0.4967)
     
     def test_bert_pooler_similarity(self):
         wordvec, vocab = get_wordvec()
@@ -110,6 +113,8 @@ class TestWordEmbedding(unittest.TestCase):
         mask = q != 0
 
         emb, _ = wordvec(q, mask, return_dict=False)
+        emb = emb.masked_fill(~mask.unsqueeze(-1), 0)  # we masks the output
+
         out = we(q, mask)
 
         self.assertTrue(torch.equal(emb, out))
