@@ -3,7 +3,6 @@ import unittest
 import torch
 
 from weakvg.wordvec import (
-    WordvecBuilder,
     BertBuilder,
     get_wordvec,
     get_objects_vocab,
