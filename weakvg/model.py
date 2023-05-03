@@ -12,6 +12,7 @@ from weakvg.masking import (
     get_queries_mask,
     get_queries_mask_,
     get_relations_mask_,
+    get_multimodal_mask,
 )
 from weakvg.utils import ext_textual, ext_visual, iou, mask_softmax, tlbr2ctwh
 
@@ -39,97 +40,52 @@ class WeakvgModel(pl.LightningModule):
         self.we = WordEmbedding(wordvec, hid_size=hidden_size, freeze=True)
         # self.concept_branch = ConceptBranch()
         self.visual_branch = VisualBranch(hid_size=hidden_size)
-        self.prediction_module = SimilarityPredictionModule(omega=omega)
+        # self.prediction_module = SimilarityPredictionModule(omega=omega)
         self.loss = Loss(neg_selection=neg_selection)
-
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
-        self.act = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, 1)
+        self.heads_encoder = HeadsEncoder()
+        self.labels_encoder = LabelsEncoder(word_embedding=self.we)
 
         self.save_hyperparameters(ignore=["wordvec", "vocab"])
 
     def forward(self, x):
         queries = x["queries"]
-        is_word, is_query = get_queries_mask_(x)
+        proposals = x["proposals"]
+
+        is_word, _ = get_queries_mask_(x)
 
         queries_e, queries_pooler = self.we(
             queries, is_word, return_pooler=True
         )  # [b, q, w, d], [b, q, d]
-        heads_e = None  # TODO: get the heads embedding from queries_e through index
-        labels_e = None  # TODO: follow the paper
 
-        # heads
+        x |= {"queries_e": queries_e}
 
-        heads = x["heads"]  # [b, q, h]
-        heads = heads[..., 0]  # [b, q] - select the first head
-        is_head = (queries == heads.unsqueeze(-1)) & is_query.unsqueeze(-1)  # [b, q, w]
-        queries_h = queries.masked_fill(~is_head, 0)  # [b, q, w]
-        index = queries_h.argmax(-1)  # [b, q]
-        index = index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 1, queries_e.size(-1))  # [b, q, 1, d]
-        heads_e = queries_e.gather(-2, index).squeeze(-2)  # [b, q, d]
-        heads_e.masked_fill(~is_query.unsqueeze(-1), 0)
+        heads_e = self.heads_encoder(x)  # [b, q, d]
+        labels_e = self.labels_encoder(x)  # [b, p, q, d]
 
-        # labels
+        x |= {"heads_e": heads_e, "labels_e": labels_e}
 
-        queries = x["queries"]  # [b, q, w]
-        labels = x["labels"]  # [b, p]
+        b = queries.shape[0]
         q = queries.shape[1]
-        w = queries.shape[-1]
-        p = labels.shape[-1]
-        labels = labels.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, q, w)  # [b, p, q, w]
-        queries = queries.unsqueeze(1).repeat(1, p, 1, 1)  # [b, p, q, w]
-        # calcolo maschera head
-        heads = x["heads"]  # [b, q, h]
-        heads = heads[..., 0]  # [b, q] - select the first head
-        is_head = (x["queries"] == heads.unsqueeze(-1)) & is_query.unsqueeze(-1)  # [b, q, w]
-        is_head = is_head.unsqueeze(1).repeat(1, p, 1, 1)  # [b, p, q, w]
+        p = proposals.shape[1]
 
-        is_head = is_head.long()
+        visual_feat = self.visual_branch(x)  # [b, p, q, d]
+        visual_feat = (
+            visual_feat.transpose(0, 2).reshape(1, q, b, p, -1).repeat(b, 1, 1, 1, 1)
+        )  # [b, q, b, p, d]
+        textual_feat = queries_pooler.reshape(b, q, 1, 1, -1).repeat(
+            1, 1, b, p, 1
+        )  # [b, q, b, p, d]
 
-        # azzero gli indici dove c'è la head e sommo l'indice della label (0 + label)
-        new_q = queries * (1 - is_head) + labels * is_head
-
-        is_head = is_head.bool()
-    
-        queries_ext_e = self.we(new_q, is_head)  # [b, p, q, w, d]
-
-        # ottengo l'indice della head head per estrarre l'embedding della label
-        queries_h = queries.masked_fill(~is_head, 0)  # [b, p, q, w]
-        index = queries_h.argmax(-1)  # [b, p, q]
-        index = index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 1, 1, queries_e.size(-1))  # [b, p, q, 1, d]
-        labels_e = queries_ext_e.gather(-2, index).squeeze(-2)  # [b, p, q, d]
-
-        x |= {"queries_e": queries_e, "heads_e": heads_e, "labels_e": labels_e}
+        multimodal_mask = get_multimodal_mask(queries, proposals)
+        logits = torch.cosine_similarity(
+            visual_feat, textual_feat, dim=-1
+        )  # [b, q, b, p]
+        logits = mask_softmax(logits, multimodal_mask)
+        scores = torch.softmax(logits, dim=-1)  # [b, q, b, p]
+        scores = scores.masked_fill(~multimodal_mask, 0)
 
         # TODO: concepts branch temporarily disabled
-        # concepts_pred = self.concept_branch(x)  # [b, q, b, p]
-        b = x["proposals"].shape[0]
-        visual_feat = self.visual_branch(x)
-        visual_feat = visual_feat.transpose(1, 2).unsqueeze(2).repeat(1, 1, b, 1, 1)  # [b, q, b, q, d]
-        textual_feat = queries_pooler  # [b, q, d]
-        textual_feat = textual_feat.unsqueeze(2).unsqueeze(3).repeat(1, 1, b, p, 1)  # [b, q, b, p, d]
-
-        visual_mask = get_proposals_mask_(x).unsqueeze(-2).unsqueeze(-2).repeat(1, q, b, 1)
-        textual_mask = get_queries_mask_(x)[1].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, b, p)
-        mask = visual_mask & textual_mask
-        mask = mask.unsqueeze(-1)
-
-        # scores, (multimodal_scores, concepts_scores) = self.prediction_module(
-        #     (visual_feat, visual_mask),
-        #     (textual_feat, textual_mask),
-        #     # (concepts_pred, concepts_mask),
-        # )  # [b, q, b, p], ([b, q, b, p], [b, q, b, p])
-
-        inp = torch.cat([visual_feat, textual_feat], dim=-1)
-        inp = inp.masked_fill(~mask, 0)
-
-        inp = self.fc1(inp)
-        inp = self.act(inp)
-        scores = self.fc2(inp)
-
-        scores = scores.masked_fill(~mask, 0)
-
-        return scores.squeeze(-1), (None, None)
+        return scores, (None, None)
 
     def step(self, batch, batch_idx):
         """
@@ -272,81 +228,116 @@ class WeakvgModel(pl.LightningModule):
         return point_it
 
 
-class SimilarityPredictionModule(nn.Module):
-    def __init__(self, omega):
+class HeadsEncoder(nn.Module):
+    def forward(self, x):
+        assert "queries_e" in x, "Queries embedding is required"
+
+        heads = x["heads"]  # [b, q, h]
+        queries = x["queries"]  # [b, q, w]
+        queries_e = x["queries_e"]  # [b, q, w, d]
+
+        b = queries_e.shape[0]
+        q = queries_e.shape[1]
+        d = queries_e.shape[3]
+
+        is_query = get_queries_mask(queries)[1].reshape(b, q, 1, 1)  # [b, q, 1, 1]
+
+        heads_i = HeadsEncoder.get_heads_index(queries, heads)  # [b, q]
+
+        heads_i = heads_i.reshape(b, q, 1, 1).repeat(1, 1, 1, d)  # [b, q, 1, d]
+        heads_e = queries_e.gather(-2, heads_i)  # [b, q, 1, d]
+        heads_e = heads_e.masked_fill(~is_query, 0)  # [b, q, 1, d]
+        heads_e = heads_e.squeeze(-2)  # [b, q, d]
+
+        return heads_e
+
+    @staticmethod
+    def get_heads_index(queries, heads):
+        # queries: [b, q, w]
+        # heads: [b, q, h]
+
+        is_head = HeadsEncoder.get_heads_mask(queries, heads)  # [b, q, w]
+
+        queries = queries * is_head  # [b, q, w]
+        index = queries.argmax(-1)  # [b, q]
+        return index
+
+    @staticmethod
+    def get_heads_mask(queries, heads):
+        # queries: [b, q, w]
+        # head: [b, q]
+
+        is_query = get_queries_mask(queries)[1].unsqueeze(-1)  # [b, q, 1]
+
+        head = HeadsEncoder._select_head(heads)  # [b, q]
+        head = head.unsqueeze(-1)  # [b, q, 1]
+
+        is_head = queries == head  # [b, q, w]
+        is_head = is_head & is_query  # discard padding
+
+        return is_head
+
+    @staticmethod
+    def _select_head(heads):
+        # for sake of simplicity, we assume that there will be only
+        # one head per query
+        head = heads[..., 0]  # [b, q]
+        return head
+
+
+class LabelsEncoder(nn.Module):
+    def __init__(self, word_embedding):
         super().__init__()
-        self.softmax = nn.Softmax(dim=-1)
-        self.omega = omega
-        # self.
+        self.we = word_embedding
 
-    def forward(self, visual, textual, concepts):
-        """
-        :param visual: A tuple `(visual_feat, visual_mask)`, where `visual_feat` is a
-            tensor of shape `[b, p, d]` and `visual_mask` is a tensor of shape `[b, p]`
+    def forward(self, x):
+        queries = x["queries"]  # [b, q, w]
+        labels = x["labels"]  # [b, p]
+        heads = x["heads"]  # [b, q, h]
+        proposals = x["proposals"]  # [b, p, 4]
 
-        :param textual: A tuple `(textual_feat, textual_mask)`, where `textual_feat`
-            is a tensor of shape `[b, q, d]` and `textual_mask` is a tensor of
-            shape `[b, q]`
+        b = queries.shape[0]
+        q = queries.shape[1]
+        w = queries.shape[2]
+        p = labels.shape[1]
 
-        :param concepts: A tuple `(concepts_pred, concepts_mask)`, where `concepts_pred`
-            is a tensor of shape `[b, q, b, p]` and `concepts_mask` is a tensor of
-            shape `[b, q, b, p]`
+        head_mask = HeadsEncoder.get_heads_mask(queries, heads)  # [b, q, w]
+        head_mask = head_mask.reshape(b, 1, q, w).repeat(1, p, 1, 1)  # [b, p, q, w]
+        queries_ext = queries.reshape(b, 1, q, w).repeat(1, p, 1, 1)  # [b, p, q, w]
+        labels_ext = labels.reshape(b, p, 1, 1).repeat(1, 1, q, w)  # [b, p, q, w]
 
-        :return: A tensor of shape `[b, q, b, p], ([b, q, b, p], [b, q, b, p])` with the
-            similarity scores and the two predictions of the underlying models: the
-            multimodal prediction and the concepts prediction
-        """
-        multimodal_pred, multimodal_mask = self.predict_multimodal(
-            visual, textual
-        )  # [b, q, b, p], [b, q, b, p]
-        # concepts_pred, concepts_mask = self.predict_concepts(
-        #     concepts
-        # )  # [b, q, b, p], [b, q, b, p]
+        queries_l = self.replace_heads_with_labels(
+            queries_ext, labels_ext, head_mask
+        )  # [b, p, q, w]
 
-        # scores = self.apply_prior(multimodal_pred, concepts_pred)  # [b, q, b, p]
-        scores = multimodal_pred
+        is_word = (
+            get_queries_mask(queries)[0].reshape(b, 1, q, w).repeat(1, p, 1, 1)
+        )  # [b, p, q, w]
+        queries_e = self.we(queries_l, is_word)  # [b, p, q, w, d]
 
-        # mask = multimodal_mask & concepts_mask  # [b, q, b, p]
-        mask = multimodal_mask
+        d = queries_e.shape[-1]
 
-        scores = scores.masked_fill(~mask, 0)  # [b, q, b, p]
+        label_i = HeadsEncoder.get_heads_index(queries, heads)  # [b, q]
+        label_i = label_i.reshape(b, 1, q, 1, 1).repeat(
+            1, p, 1, 1, d
+        )  # [b, p, q, 1, d]
 
-        # return scores, (multimodal_pred, concepts_pred)
-        return scores, (multimodal_pred, torch.zeros_like(multimodal_pred))
+        labels_e = queries_e.gather(-2, label_i)  # [b, p, q, 1, d]
+        labels_e = labels_e.squeeze(-2)  # [b, p, q, d]
 
-    def predict_multimodal(self, visual, textual):
-        visual_feat, visual_mask = visual  # [b, q, d], [b, q]
-        textual_feat, textual_mask = textual  # [b, p, d], [b, p]
+        is_query = (
+            get_queries_mask(queries)[1].reshape(b, 1, q, 1).repeat(1, p, 1, 1)
+        )  # [b, p, q, 1]
+        is_proposal = (
+            get_proposals_mask(proposals).reshape(b, p, 1, 1).repeat(1, 1, q, 1)
+        )  # [b, p, q, 1]
+        labels_e = labels_e.masked_fill(~(is_query & is_proposal), 0)  # [b, p, q, d]
 
-        b = textual_feat.shape[0]
-        q = textual_feat.shape[1]
-        p = visual_feat.shape[1]
+        return labels_e
 
-        visual_feat, visual_mask = ext_visual(visual_feat, visual_mask, b, q, p)
-        textual_feat, textual_mask = ext_textual(textual_feat, textual_mask, b, q, p)
-
-        multimodal_mask = visual_mask & textual_mask  # [b, q, b, p]
-
-        multimodal_pred = torch.cosine_similarity(
-            visual_feat, textual_feat, dim=-1
-        )  # [b, q, b, p]
-        multimodal_pred = mask_softmax(multimodal_pred, multimodal_mask)  # [b, p, b, p]
-        multimodal_pred = self.softmax(multimodal_pred)  # [b, p, b, p]
-
-        return multimodal_pred, multimodal_mask
-
-    def predict_concepts(self, concepts):
-        concepts_pred, concepts_mask = concepts  # [b, q, b, p], [b, q, b, p]
-
-        concepts_pred = mask_softmax(concepts_pred, concepts_mask)  # [b, q, b, p]
-        concepts_pred = self.softmax(concepts_pred)  # [b, q, b, p]
-
-        return concepts_pred, concepts_mask
-
-    def apply_prior(self, predictions, prior):
-        w = self.omega
-
-        return w * predictions + (1 - w) * prior  # [b, q, b, p]
+    def replace_heads_with_labels(self, queries, labels, where):
+        where = where.long()
+        return queries * (1 - where) + labels * where
 
 
 class WordEmbedding(nn.Module):
